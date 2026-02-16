@@ -127,22 +127,30 @@ exports.generateImagePrompt = onCall(async (request) => {
         ? "Dini Bayram (religious holiday)"
         : "Özel Gün (special occasion)";
 
-  const systemPrompt = `You are an expert at writing DALL-E 3 image prompts for greeting card BACKGROUND images. The user gives you a Turkish special day. You output exactly ONE prompt in English, for DALL-E 3 only.
-CRITICAL RULES:
-- NO PEOPLE: The image must contain ZERO humans. No faces, no portraits, no silhouettes, no figures, no hands, no crowd. Use ONLY inanimate elements: symbols, objects, landscapes, architecture, flags, flowers, monuments (from distance, no people), nature, still life, colors, and cultural objects that clearly represent the occasion.
-- National holidays (milli bayram), religious holidays (dini bayram), and special days (özel gün) are sacred and important. The image must be RESPECTFUL and ACCURATE.
-- The image must CONCRETELY and CLEARLY represent ONLY this specific occasion through symbols and scenes without any person. No text, NO letters, NO numbers, NO logos, NO watermarks anywhere in the image.
-- Output ONLY the DALL-E prompt in English. No explanations, no quotes, no "Prompt:" prefix, no markdown. Just the single prompt text.`;
+  const systemPrompt = `You write DALL-E 3 image prompts for greeting card backgrounds. The user gives a Turkish special day. Output exactly ONE prompt in English.
+CRITICAL:
+- NO PEOPLE: zero humans, faces, silhouettes, figures, hands, crowds. Only inanimate elements: symbols, objects, landscapes, architecture, flags, flowers, monuments (no people), nature, still life, cultural objects that CONCRETELY represent THIS specific occasion.
+- National and religious holidays are sacred. Be RESPECTFUL and accurate to the meaning of the day.
+- Be CONCRETE: name specific symbols, colors, and scenes that belong to this day only (e.g. for Ramadan: crescent, lanterns, dates, night sky; for Victory Day: specific monuments, dawn, Turkish motifs). Avoid generic "celebration" or "festive" filler.
+- VARY every time: use different composition (close-up of objects / wide scene / still life / atmosphere), different lighting (golden hour, night, soft morning), and different focal elements. Do not repeat the same sentence structure or the same opening words.
+- ABSOLUTELY NO TEXT ON THE IMAGE: no words, no letters, no numbers, no captions, no labels, no signs, no writing, no watermarks, no logos. The image must be PURE VISUAL ONLY—anything that could be read as text is forbidden. Add at the end of your prompt: "no text, no words, no letters, no writing."
+- Output ONLY the English prompt. No explanation, no quotes, no "Prompt:" prefix.`;
 
-  let userPrompt = `Create a DALL-E 3 prompt for this occasion. IMPORTANT: The image must have NO people. Use only symbols, objects, landscapes, flags, architecture, nature, or still life that represent the day.
-Name: ${eventName}
-Type: ${typeLabel}`;
+  const compositionHints = [
+    "Focus on a specific symbolic object or still life.",
+    "Focus on a wide atmospheric scene (sky, landscape, architecture).",
+    "Focus on light and color that evoke this day.",
+  ];
+  const hint = compositionHints[Math.floor(Math.random() * compositionHints.length)];
+
+  let userPrompt = `Occasion: ${eventName} (${typeLabel}). ${hint}
+NO people. NO text/words/letters on the image—pure visual only. Represent this day CONCRETELY with symbols and scenes.`;
   if (isLandscape) {
-    userPrompt += "\nFormat: Landscape (wide) composition suitable for 16:9.";
+    userPrompt += " Format: landscape 16:9.";
   } else {
-    userPrompt += "\nFormat: Square composition.";
+    userPrompt += " Format: square.";
   }
-  userPrompt += "\n\nOutput only the single English prompt, nothing else.";
+  userPrompt += "\n\nEnd your prompt with: no text, no words, no letters. Output only the single English prompt.";
 
   const openai = getOpenAIClient();
   const completion = await openai.chat.completions.create({
@@ -152,7 +160,7 @@ Type: ${typeLabel}`;
       { role: "user", content: userPrompt },
     ],
     max_tokens: 280,
-    temperature: 0.6,
+    temperature: 0.85,
   });
   const prompt = (completion.choices?.[0]?.message?.content ?? "").trim();
   return { prompt };
@@ -169,8 +177,9 @@ exports.generateImage = onCall(async (request) => {
 
   if (useReplicate) {
     const replicate = getReplicateClient();
+    const promptNoText = prompt.replace(/\s*\.?\s*$/, "") + ". No text, no words, no letters, no writing in the image.";
     const output = await replicate.run("black-forest-labs/flux-schnell", {
-      input: { prompt },
+      input: { prompt: promptNoText },
     });
     const imageUrl = typeof output === "string" ? output : Array.isArray(output) ? output[0] : output?.url ?? null;
     if (!imageUrl) throw new HttpsError("internal", "Replicate görsel URL döndürmedi.");
@@ -179,9 +188,10 @@ exports.generateImage = onCall(async (request) => {
 
   const openai = getOpenAIClient();
   const imageSize = size || "1024x1024";
+  const promptNoText = prompt.replace(/\s*\.?\s*$/, "") + " No text, no words, no letters, no writing.";
   const resp = await openai.images.generate({
     model: "dall-e-3",
-    prompt,
+    prompt: promptNoText,
     n: 1,
     size: imageSize,
     quality: "hd",
@@ -204,31 +214,28 @@ exports.generateMessage = onCall(async (request) => {
 
   const isShort = tone === "short";
   const systemPrompt = isShort
-    ? `Sen kutlama görselleri için çok kısa mesaj yazan bir yazarsın. Türkçe yaz.
-KESİN KURALLAR (Kısa ton):
-- Mesaj TEK cümle, maksimum 10-12 kelime
-- Görsel üzerinde tek satırda okunacak kadar kısa
-- Emoji KULLANMA, hashtag KULLANMA
-- Sadece mesajı yaz, başka hiçbir şey yazma`
-    : `Sen profesyonel kutlama mesajı yazan bir yazarsın. Türkçe yaz.
-KURALLAR:
-- Mesaj 1-2 cümle, etkili ve okunabilir olsun; çok uzun tutma
-- Emoji KULLANMA, hashtag KULLANMA
-- Sadece mesajı yaz, başka hiçbir şey yazma
-- Klişe kalıplardan kaçın, özgün ol`;
+    ? `Kutlama kartı görselinin ÜZERİNE yazılacak mesaj. Türkçe. Görsele SIĞMALI.
+- MAKSIMUM 6-8 KELİME. Tek cümle, tek satır. Daha uzun yazma.
+- Emoji ve hashtag YOK. Sadece mesaj.
+- Farklı açılışlar kullan; "Bu özel günümüzde" gibi uzun kalıplardan kaçın. Kısa ve öz.`
+    : `Kutlama kartı görselinin ÜZERİNE yazılacak mesaj. Türkçe. Görsele SIĞMALI.
+- TEK CÜMLE, MAKSIMUM 10-12 KELİME. Uzun cümleler yasak—görselde tek satırda okunacak.
+- Emoji ve hashtag yok. Özgün ve tekrarsız; o güne özgü kısa bir dilek.`;
 
   const toneDesc =
     tone === "corporate"
-      ? "Resmi ve kurumsal."
+      ? "Resmi, kısa."
       : tone === "friendly"
-        ? "Samimi ve sıcak."
+        ? "Samimi, kısa."
         : tone === "enthusiastic"
-          ? "Coşkulu ve enerjik."
-          : "Çok kısa, tek cümle, max 12 kelime.";
-  let userPrompt = `"${eventName}" için kutlama mesajı yaz.\nTon: ${toneDesc}`;
+          ? "Coşkulu, kısa."
+          : "Çok kısa, max 6-8 kelime.";
+
+  let userPrompt = `"${eventName}" için görsel üstüne sığacak kısa kutlama mesajı. Ton: ${toneDesc}. TEK CÜMLE, az kelime.`;
   if (companyName && String(companyName).trim()) {
-    userPrompt += `\nFirma: ${String(companyName).trim()}`;
+    userPrompt += ` Firma: ${String(companyName).trim()}`;
   }
+  userPrompt += "\n\nUzun yazma; görsele sığmalı (max 10-12 kelime).";
 
   const openai = getOpenAIClient();
   const completion = await openai.chat.completions.create({
@@ -237,8 +244,8 @@ KURALLAR:
       { role: "system", content: systemPrompt },
       { role: "user", content: userPrompt },
     ],
-    max_tokens: 90,
-    temperature: 0.9,
+    max_tokens: 72,
+    temperature: 0.92,
   });
   const message = (completion.choices?.[0]?.message?.content ?? "").trim();
   return { message };
