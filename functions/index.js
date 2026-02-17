@@ -1,20 +1,8 @@
 /**
- * Kutla – Firebase Cloud Functions (güvenli proxy)
- * API key'leri asla istemciye gönderilmez; tüm çağrılar sunucuda yapılır.
+ * Kutla – Firebase Cloud Functions
  *
- * Genel proxy (isteğe bağlı kullanım):
- *   callOpenAI  – { model?, messages } → { message, usage? }
- *   callReplicate – { model, input } → { output }
- *
- * Kutla iOS uygulamasıyla uyumlu callable'lar:
- *   generateImagePrompt – { eventName, eventType, isLandscape } → { prompt }
- *   generateImage       – { prompt, size?, provider } → { imageUrl }
- *   generateMessage     – { eventName, tone, companyName? } → { message }
- *
- * Kurulum:
- * 1. firebase login
- * 2. functions/.env.<projectId> içinde OPENAI_API_KEY ve REPLICATE_API_TOKEN
- * 3. firebase deploy --only functions
+ * Görsel ve metin üretimi tamamen backend'de yapılır.
+ * İstemci sadece kullanıcı seçimlerini gönderir: etkinlik, ton, format. Sağlayıcı backend'de seçilir.
  */
 
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
@@ -25,217 +13,249 @@ const Replicate = require("replicate");
 const openAiKey = defineString("OPENAI_API_KEY");
 const replicateToken = defineString("REPLICATE_API_TOKEN");
 
+// --- Sabitler ---
+const REPLICATE_MODELS = {
+  fluxSchnell: "black-forest-labs/flux-schnell",
+  sdxl: "stability-ai/sdxl:7762fd07cf82c948538e41f63f77d685e02b063e37e496e96eefd46c929f9bdc",
+  stableDiffusion: "stability-ai/stable-diffusion:ac732df83cea7fff18b8472768c88ad041fa750ff7682a21affe81863cbe77e4",
+};
+
+const ART_STYLES = [
+  "Cinematic Photorealism, 8k, dramatic lighting, raytracing",
+  "Modern Digital Art, vector style, clean lines, smooth gradients",
+  "Oil Painting, textured, classical fine art style",
+  "Double Exposure, blending symbols with nature/sky",
+  "Minimalist 3D Render, soft pastel colors, high end design",
+  "Watercolor Illustration, artistic, dreamy and soft edges",
+  "Turkish Tezhip Art (Islamic illumination), gold details (only for religious days)",
+  "Paper Cutout Art, depth and shadows",
+];
+
+const NO_TEXT_SUFFIX = " . no text, no writing, no letters, no watermark, high quality, 8k, detailed.";
+const NEGATIVE_PROMPT = "text, words, letters, signature, watermark, logo, ugly, deformed, blurry, bad anatomy, distorted face, extra limbs, low quality, grainy.";
+
+// --- İstemci gönderimi ---
+const PROVIDER_OPENAI = "openAIDALLE3";
+const PROVIDER_FLUX = "replicateFluxSchnell";
+const PROVIDER_SDXL = "replicateSdxl";
+const PROVIDER_SD = "replicateStableDiffusion";
+const PROVIDER_STABILITY_CORE = "stabilityStableImageCore";
+
 function getOpenAIClient() {
   const key = openAiKey.value();
-  if (!key) {
-    throw new HttpsError(
-      "failed-precondition",
-      "OPENAI_API_KEY tanımlı değil. functions/.env.<projectId> dosyasına ekleyin."
-    );
-  }
+  if (!key) throw new HttpsError("failed-precondition", "OPENAI_API_KEY eksik.");
   return new OpenAI({ apiKey: key });
 }
 
 function getReplicateClient() {
   const token = replicateToken.value();
-  if (!token) {
-    throw new HttpsError(
-      "failed-precondition",
-      "REPLICATE_API_TOKEN tanımlı değil. functions/.env.<projectId> dosyasına ekleyin."
-    );
-  }
+  if (!token) throw new HttpsError("failed-precondition", "REPLICATE_API_TOKEN eksik.");
   return new Replicate({ auth: token });
 }
 
-/**
- * OpenAI çağrısı (sunucuda). İstemci sadece isteği ve sonucu görür, key görmez.
- * data: { model?, messages } — messages OpenAI formatında (role + content).
- */
-exports.callOpenAI = onCall(async (request) => {
-  const data = request.data;
-  if (!data || typeof data !== "object") {
-    throw new HttpsError("invalid-argument", "data gerekli (object).");
-  }
-  const { model = "gpt-4o-mini", messages } = data;
-  if (!Array.isArray(messages) || messages.length === 0) {
-    throw new HttpsError("invalid-argument", "messages gerekli (boş olmayan dizi).");
+// --- Görsel prompt üretimi (ortak kullanım) ---
+async function buildImagePrompt(openai, eventName, eventType, isLandscape) {
+  const randomStyle = ART_STYLES[Math.floor(Math.random() * ART_STYLES.length)];
+  const format = isLandscape ? "Landscape (16:9)" : "Square (1:1)";
+
+  let safetyInstruction = "NO TEXT, NO LETTERS, NO WATERMARKS. ";
+  if (eventType === "dini") {
+    safetyInstruction += "ABSOLUTELY NO HUMAN FIGURES, NO FACES, NO ANIMALS. Focus on architecture (mosque), light, geometry, nature.";
+  } else {
+    safetyInstruction += "Avoid realistic close-up faces (to prevent AI distortion). If humans are needed (e.g. soldiers, police), use silhouettes, artistic representations or distant figures.";
   }
 
-  const openai = getOpenAIClient();
+  const systemPrompt = `
+    You are an expert AI Art Director for a Turkish Celebration App.
+    Your goal is to write a generic-free, specific, and high-quality image prompt based on the "Event Name".
+
+    INSTRUCTIONS:
+    1. **ANALYZE THE EVENT:** From the event name, infer what the day represents in Turkey and choose fitting symbols, colors, and mood (e.g. professional days → tools/badges, national days → flags/monuments, religious → moon/lanterns/architecture). Do not output generic scenes like flowers only.
+    2. **STYLE:** The image style must be: "${randomStyle}".
+    3. **FORMAT:** ${format}.
+    4. **SAFETY:** ${safetyInstruction}
+    OUTPUT: Provide ONLY the English prompt string. No explanations.
+  `;
+
+  const userPrompt = `Event Name: "${eventName}" (Type: ${eventType || "General"}). Create a visual prompt that captures the specific essence and symbols of this day.`;
+
   const completion = await openai.chat.completions.create({
-    model: String(model),
-    messages: messages.map((m) => ({
-      role: m.role || "user",
-      content: m.content,
-    })),
+    model: "gpt-4o-mini",
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ],
+    temperature: 0.85,
+    max_tokens: 250,
   });
 
-  const choice = completion.choices?.[0];
-  if (!choice) {
-    throw new HttpsError("internal", "OpenAI yanıtı boş.");
-  }
-  return {
-    message: {
-      role: choice.message?.role ?? "assistant",
-      content: choice.message?.content ?? null,
-    },
-    usage: completion.usage ? {
-      prompt_tokens: completion.usage.prompt_tokens,
-      completion_tokens: completion.usage.completion_tokens,
-      total_tokens: completion.usage.total_tokens,
-    } : undefined,
-  };
-});
+  return (completion.choices?.[0]?.message?.content ?? "").trim();
+}
 
-/**
- * Replicate model çalıştırma (sunucuda). İstemci sadece model + input ve çıktıyı görür, token görmez.
- * data: { model, input } — model örn. "stability-ai/sdxl:...", input model'e göre.
- */
-exports.callReplicate = onCall(async (request) => {
-  const data = request.data;
-  if (!data || typeof data !== "object") {
-    throw new HttpsError("invalid-argument", "data gerekli (object).");
+function parseReplicateImageOutput(output) {
+  if (typeof output === "string") return output;
+  if (Array.isArray(output)) return output[0] ?? null;
+  return output?.url ?? output ?? null;
+}
+
+function sanitizePrompt(prompt) {
+  return prompt.replace(/\s*\.?\s*$/, "") + NO_TEXT_SUFFIX;
+}
+
+/** Replicate / OpenAI ile görsel üretir. Prompt zaten hazır. */
+async function runImageGeneration(options) {
+  const { prompt, provider, size, aspectRatio } = options;
+  const safePrompt = sanitizePrompt(prompt);
+
+  if (provider === PROVIDER_OPENAI) {
+    const openai = getOpenAIClient();
+    const dallESize = size || (aspectRatio === "16:9" ? "1792x1024" : "1024x1024");
+    const resp = await openai.images.generate({
+      model: "dall-e-3",
+      prompt: safePrompt,
+      n: 1,
+      size: dallESize,
+      quality: "standard",
+      response_format: "url",
+    });
+    const imageUrl = resp.data?.[0]?.url;
+    if (!imageUrl) throw new HttpsError("internal", "OpenAI görsel URL döndürmedi.");
+    return imageUrl;
   }
-  const { model, input } = data;
-  if (!model || typeof model !== "string") {
-    throw new HttpsError("invalid-argument", "model gerekli (string).");
-  }
-  if (!input || typeof input !== "object") {
-    throw new HttpsError("invalid-argument", "input gerekli (object).");
+
+  if (provider === PROVIDER_STABILITY_CORE) {
+    throw new HttpsError("unimplemented", "stabilityStableImageCore için Stability API entegrasyonu yapılandırılmadı.");
   }
 
   const replicate = getReplicateClient();
-  const output = await replicate.run(model, { input });
+  const ratio = aspectRatio || "1:1";
 
-  return { output };
-});
+  let modelId = REPLICATE_MODELS.sdxl;
+  let inputParams = {
+    prompt: safePrompt,
+    negative_prompt: NEGATIVE_PROMPT,
+    width: 1024,
+    height: 1024,
+    scheduler: "K_EULER",
+    num_inference_steps: 30,
+    guidance_scale: 7.5,
+  };
 
-// ---------- Kutla uygulamasına özel callable'lar (aynı proxy, aynı key'ler) ----------
+  if (provider === PROVIDER_FLUX) {
+    modelId = REPLICATE_MODELS.fluxSchnell;
+    inputParams = {
+      prompt: safePrompt + " --no text --no watermark",
+      aspect_ratio: ratio,
+      output_format: "jpg",
+      output_quality: 90,
+    };
+  } else if (provider === PROVIDER_SDXL) {
+    if (ratio === "16:9") {
+      inputParams.width = 1024;
+      inputParams.height = 576;
+    }
+  } else if (provider === PROVIDER_SD) {
+    modelId = REPLICATE_MODELS.stableDiffusion;
+    if (ratio === "16:9") {
+      inputParams.width = 1024;
+      inputParams.height = 576;
+    }
+  }
 
-/**
- * Görsel prompt üretir (GPT). İstemci: { eventName, eventType, isLandscape } → { prompt }
- */
+  const output = await replicate.run(modelId, { input: inputParams });
+  const imageUrl = parseReplicateImageOutput(output);
+  if (!imageUrl) throw new HttpsError("internal", "Replicate görsel URL döndürmedi.");
+  return String(imageUrl);
+}
+
+// --- Callable: generateImagePrompt (isteğe bağlı; istemci tek çağrıda generateImage kullanacak) ---
 exports.generateImagePrompt = onCall(async (request) => {
   const { eventName, eventType, isLandscape } = request.data || {};
-  if (!eventName || !eventType) {
-    throw new HttpsError("invalid-argument", "eventName ve eventType gerekli.");
-  }
-  const typeLabel =
-    eventType === "milli"
-      ? "Milli Bayram (national holiday)"
-      : eventType === "dini"
-        ? "Dini Bayram (religious holiday)"
-        : "Özel Gün (special occasion)";
-
-  const systemPrompt = `You write DALL-E 3 image prompts for greeting card backgrounds. The user gives a Turkish special day. Output exactly ONE prompt in English.
-CRITICAL:
-- NO PEOPLE: zero humans, faces, silhouettes, figures, hands, crowds. Only inanimate elements: symbols, objects, landscapes, architecture, flags, flowers, monuments (no people), nature, still life, cultural objects that CONCRETELY represent THIS specific occasion.
-- National and religious holidays are sacred. Be RESPECTFUL and accurate to the meaning of the day.
-- Be CONCRETE: name specific symbols, colors, and scenes that belong to this day only (e.g. for Ramadan: crescent, lanterns, dates, night sky; for Victory Day: specific monuments, dawn, Turkish motifs). Avoid generic "celebration" or "festive" filler.
-- VARY every time: use different composition (close-up of objects / wide scene / still life / atmosphere), different lighting (golden hour, night, soft morning), and different focal elements. Do not repeat the same sentence structure or the same opening words.
-- ABSOLUTELY NO TEXT ON THE IMAGE: no words, no letters, no numbers, no captions, no labels, no signs, no writing, no watermarks, no logos. The image must be PURE VISUAL ONLY—anything that could be read as text is forbidden. Add at the end of your prompt: "no text, no words, no letters, no writing."
-- Output ONLY the English prompt. No explanation, no quotes, no "Prompt:" prefix.`;
-
-  const compositionHints = [
-    "Focus on a specific symbolic object or still life.",
-    "Focus on a wide atmospheric scene (sky, landscape, architecture).",
-    "Focus on light and color that evoke this day.",
-  ];
-  const hint = compositionHints[Math.floor(Math.random() * compositionHints.length)];
-
-  let userPrompt = `Occasion: ${eventName} (${typeLabel}). ${hint}
-NO people. NO text/words/letters on the image—pure visual only. Represent this day CONCRETELY with symbols and scenes.`;
-  if (isLandscape) {
-    userPrompt += " Format: landscape 16:9.";
-  } else {
-    userPrompt += " Format: square.";
-  }
-  userPrompt += "\n\nEnd your prompt with: no text, no words, no letters. Output only the single English prompt.";
-
+  if (!eventName) throw new HttpsError("invalid-argument", "eventName zorunludur.");
   const openai = getOpenAIClient();
-  const completion = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userPrompt },
-    ],
-    max_tokens: 280,
-    temperature: 0.85,
-  });
-  const prompt = (completion.choices?.[0]?.message?.content ?? "").trim();
+  const prompt = await buildImagePrompt(openai, eventName, eventType ?? null, !!isLandscape);
   return { prompt };
 });
 
-/**
- * Görsel üretir (DALL-E 3 veya Replicate flux-schnell). İstemci: { prompt, size?, provider } → { imageUrl }
- */
-exports.generateImage = onCall(async (request) => {
-  const { prompt, size, provider } = request.data || {};
-  if (!prompt) throw new HttpsError("invalid-argument", "prompt gerekli.");
-  const useReplicate =
-    provider === "replicateFluxSchnell" || provider === undefined || provider === null;
+// Hangi görsel sağlayıcısının kullanılacağı sadece backend'de belirlenir (env ile değiştirilebilir).
+const DEFAULT_IMAGE_PROVIDER = PROVIDER_FLUX;
 
-  if (useReplicate) {
-    const replicate = getReplicateClient();
-    const promptNoText = prompt.replace(/\s*\.?\s*$/, "") + ". No text, no words, no letters, no writing in the image.";
-    const output = await replicate.run("black-forest-labs/flux-schnell", {
-      input: { prompt: promptNoText },
-    });
-    const imageUrl = typeof output === "string" ? output : Array.isArray(output) ? output[0] : output?.url ?? null;
-    if (!imageUrl) throw new HttpsError("internal", "Replicate görsel URL döndürmedi.");
-    return { imageUrl: String(imageUrl) };
+// --- Callable: generateImage ---
+// İstemci sadece kullanıcı seçimlerini gönderir: eventName, eventType, isLandscape.
+// Prompt ve sağlayıcı backend'de. Eski kullanım (prompt gönderme) desteklenir.
+exports.generateImage = onCall(async (request) => {
+  const { eventName, eventType, isLandscape } = request.data || {};
+  const aspectRatio = isLandscape ? "16:9" : "1:1";
+
+  let prompt;
+  if (eventName != null && eventName !== "") {
+    const openai = getOpenAIClient();
+    prompt = await buildImagePrompt(openai, eventName, eventType ?? null, !!isLandscape);
+  } else {
+    const legacyPrompt = request.data?.prompt;
+    if (!legacyPrompt) throw new HttpsError("invalid-argument", "eventName veya prompt zorunludur.");
+    prompt = legacyPrompt;
   }
 
-  const openai = getOpenAIClient();
-  const imageSize = size || "1024x1024";
-  const promptNoText = prompt.replace(/\s*\.?\s*$/, "") + " No text, no words, no letters, no writing.";
-  const resp = await openai.images.generate({
-    model: "dall-e-3",
-    prompt: promptNoText,
-    n: 1,
-    size: imageSize,
-    quality: "hd",
-    response_format: "url",
+  const imageUrl = await runImageGeneration({
+    prompt,
+    provider: request.data?.provider || DEFAULT_IMAGE_PROVIDER,
+    size: request.data?.size || null,
+    aspectRatio,
   });
-  const imageUrl = resp.data?.[0]?.url;
-  if (!imageUrl) throw new HttpsError("internal", "OpenAI görsel URL döndürmedi.");
   return { imageUrl };
 });
 
-/**
- * Kutlama mesajı üretir (GPT). İstemci: { eventName, tone, companyName? } → { message }
- */
+// --- Callable: generateMessage ---
 exports.generateMessage = onCall(async (request) => {
-  const { eventName, tone, companyName } = request.data || {};
-  if (!eventName || !tone) {
-    throw new HttpsError("invalid-argument", "eventName ve tone gerekli.");
-  }
+  const { eventName, eventType, tone, companyName } = request.data || {};
+  if (!eventName || !tone) throw new HttpsError("invalid-argument", "eventName ve tone gerekli.");
   if (tone === "custom") return { message: "" };
 
-  const isShort = tone === "short";
-  const systemPrompt = isShort
-    ? `Kutlama kartı görselinin ÜZERİNE yazılacak mesaj. Türkçe. Görsele SIĞMALI.
-- MAKSIMUM 6-8 KELİME. Tek cümle, tek satır. Daha uzun yazma.
-- Emoji ve hashtag YOK. Sadece mesaj.
-- Farklı açılışlar kullan; "Bu özel günümüzde" gibi uzun kalıplardan kaçın. Kısa ve öz.`
-    : `Kutlama kartı görselinin ÜZERİNE yazılacak mesaj. Türkçe. Görsele SIĞMALI.
-- TEK CÜMLE, MAKSIMUM 10-12 KELİME. Uzun cümleler yasak—görselde tek satırda okunacak.
-- Emoji ve hashtag yok. Özgün ve tekrarsız; o güne özgü kısa bir dilek.`;
-
-  const toneDesc =
-    tone === "corporate"
-      ? "Resmi, kısa."
-      : tone === "friendly"
-        ? "Samimi, kısa."
-        : tone === "enthusiastic"
-          ? "Coşkulu, kısa."
-          : "Çok kısa, max 6-8 kelime.";
-
-  let userPrompt = `"${eventName}" için görsel üstüne sığacak kısa kutlama mesajı. Ton: ${toneDesc}. TEK CÜMLE, az kelime.`;
-  if (companyName && String(companyName).trim()) {
-    userPrompt += ` Firma: ${String(companyName).trim()}`;
+  let toneInstruction = "";
+  let lengthInstruction = "1 veya 2 tam cümle. (Yaklaşık 15-20 kelime).";
+  switch (tone) {
+    case "corporate":
+      toneInstruction = "Resmi, saygılı, profesyonel ve kurumsal bir dil. 'Siz' dili kullan.";
+      break;
+    case "friendly":
+      toneInstruction = "Sıcak, samimi, içten ve dostane bir dil. 'Sen' veya 'Biz' dili kullan.";
+      break;
+    case "enthusiastic":
+      toneInstruction = "Yüksek enerjili, coşkulu, heyecan verici ve motive edici bir dil. Ünlem kullanımı uygun.";
+      break;
+    case "short":
+      toneInstruction = "Vurucu, etkileyici ve net.";
+      lengthInstruction = "Tek bir güçlü cümle. Maksimum 10 kelime. Az ama öz.";
+      break;
+    default:
+      toneInstruction = "Nazik ve kutlayıcı.";
   }
-  userPrompt += "\n\nUzun yazma; görsele sığmalı (max 10-12 kelime).";
+
+  let contextHint = "";
+  if (eventType === "dini") {
+    contextHint = "Dini terminolojiye uygun (Hayırlı, Mübarek, Rahmet, Bereket, Dua).";
+  } else if (eventType === "milli") {
+    contextHint = "Vatansever, gururlu, epik (Kutlu olsun, Minnettarız, İlelebet).";
+  } else {
+    contextHint = `Bu günün (${eventName}) anlamına özel kelimeler kullan. (Örn: Polis ise 'güven/huzur', Öğretmen ise 'gelecek/ışık').`;
+  }
+
+  const systemPrompt = `
+    Sen Türkçe metin yazarlığı konusunda uzman bir yapay zekasın.
+    GÖREV: "${eventName}" için görsel üzerine yazılacak bir kutlama mesajı oluştur.
+    DETAYLAR:
+    1. TON: ${toneInstruction}
+    2. UZUNLUK: ${lengthInstruction} Asla yarım bırakma.
+    3. İÇERİK: ${contextHint}
+    4. YASAKLAR: Emoji YOK. Hashtag YOK. "Tırnak işareti" içine alma.
+    5. KALİTE: Basit "Kutlu olsun" yazıp geçme. Duyguyu hissettir, edebi olsun.
+  `;
+
+  let userPrompt = `Etkinlik: ${eventName}.`;
+  if (companyName) {
+    userPrompt += ` (Opsiyonel: Mesajın uygun bir yerine veya sonuna ${companyName} adını nazikçe yerleştir veya şirket adına konuşuyormuş gibi yaz.)`;
+  }
 
   const openai = getOpenAIClient();
   const completion = await openai.chat.completions.create({
@@ -244,9 +264,35 @@ exports.generateMessage = onCall(async (request) => {
       { role: "system", content: systemPrompt },
       { role: "user", content: userPrompt },
     ],
-    max_tokens: 72,
-    temperature: 0.92,
+    temperature: 0.9,
+    max_tokens: 150,
   });
-  const message = (completion.choices?.[0]?.message?.content ?? "").trim();
+
+  let message = (completion.choices?.[0]?.message?.content ?? "").trim();
+  message = message.replace(/^["']|["']$/g, "");
   return { message };
+});
+
+// --- Genel proxy (mevcut kullanım için) ---
+exports.callOpenAI = onCall(async (request) => {
+  const { model = "gpt-4o-mini", messages } = request.data || {};
+  if (!messages || !Array.isArray(messages)) throw new HttpsError("invalid-argument", "messages dizisi gerekli.");
+  const openai = getOpenAIClient();
+  const completion = await openai.chat.completions.create({
+    model: String(model),
+    messages: messages.map((m) => ({ role: m.role || "user", content: m.content })),
+  });
+  const choice = completion.choices?.[0];
+  return {
+    message: { role: choice?.message?.role ?? "assistant", content: choice?.message?.content ?? null },
+    usage: completion.usage,
+  };
+});
+
+exports.callReplicate = onCall(async (request) => {
+  const { model, input } = request.data || {};
+  if (!model || !input) throw new HttpsError("invalid-argument", "model ve input gerekli.");
+  const replicate = getReplicateClient();
+  const output = await replicate.run(model, { input });
+  return { output };
 });
