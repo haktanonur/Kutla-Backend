@@ -14,11 +14,7 @@ const openAiKey = defineString("OPENAI_API_KEY");
 const replicateToken = defineString("REPLICATE_API_TOKEN");
 
 // --- Sabitler ---
-const REPLICATE_MODELS = {
-  fluxSchnell: "black-forest-labs/flux-schnell",
-  sdxl: "stability-ai/sdxl:7762fd07cf82c948538e41f63f77d685e02b063e37e496e96eefd46c929f9bdc",
-  stableDiffusion: "stability-ai/stable-diffusion:ac732df83cea7fff18b8472768c88ad041fa750ff7682a21affe81863cbe77e4",
-};
+const FLUX_SCHNELL_MODEL = "black-forest-labs/flux-schnell";
 
 const ART_STYLES = [
   "Cinematic Photorealism, 8k, dramatic lighting, raytracing",
@@ -32,14 +28,6 @@ const ART_STYLES = [
 ];
 
 const NO_TEXT_SUFFIX = " . no text, no writing, no letters, no watermark, high quality, 8k, detailed.";
-const NEGATIVE_PROMPT = "text, words, letters, signature, watermark, logo, ugly, deformed, blurry, bad anatomy, distorted face, extra limbs, low quality, grainy.";
-
-// --- İstemci gönderimi ---
-const PROVIDER_OPENAI = "openAIDALLE3";
-const PROVIDER_FLUX = "replicateFluxSchnell";
-const PROVIDER_SDXL = "replicateSdxl";
-const PROVIDER_SD = "replicateStableDiffusion";
-const PROVIDER_STABILITY_CORE = "stabilityStableImageCore";
 
 function getOpenAIClient() {
   const key = openAiKey.value();
@@ -102,67 +90,21 @@ function sanitizePrompt(prompt) {
   return prompt.replace(/\s*\.?\s*$/, "") + NO_TEXT_SUFFIX;
 }
 
-/** Replicate / OpenAI ile görsel üretir. Prompt zaten hazır. */
+/** Replicate Flux-Schnell ile görsel üretir. Prompt zaten hazır. */
 async function runImageGeneration(options) {
-  const { prompt, provider, size, aspectRatio } = options;
+  const { prompt, aspectRatio } = options;
   const safePrompt = sanitizePrompt(prompt);
-
-  if (provider === PROVIDER_OPENAI) {
-    const openai = getOpenAIClient();
-    const dallESize = size || (aspectRatio === "16:9" ? "1792x1024" : "1024x1024");
-    const resp = await openai.images.generate({
-      model: "dall-e-3",
-      prompt: safePrompt,
-      n: 1,
-      size: dallESize,
-      quality: "standard",
-      response_format: "url",
-    });
-    const imageUrl = resp.data?.[0]?.url;
-    if (!imageUrl) throw new HttpsError("internal", "OpenAI görsel URL döndürmedi.");
-    return imageUrl;
-  }
-
-  if (provider === PROVIDER_STABILITY_CORE) {
-    throw new HttpsError("unimplemented", "stabilityStableImageCore için Stability API entegrasyonu yapılandırılmadı.");
-  }
-
   const replicate = getReplicateClient();
   const ratio = aspectRatio || "1:1";
 
-  let modelId = REPLICATE_MODELS.sdxl;
-  let inputParams = {
-    prompt: safePrompt,
-    negative_prompt: NEGATIVE_PROMPT,
-    width: 1024,
-    height: 1024,
-    scheduler: "K_EULER",
-    num_inference_steps: 30,
-    guidance_scale: 7.5,
+  const inputParams = {
+    prompt: safePrompt + " --no text --no watermark",
+    aspect_ratio: ratio,
+    output_format: "jpg",
+    output_quality: 90,
   };
 
-  if (provider === PROVIDER_FLUX) {
-    modelId = REPLICATE_MODELS.fluxSchnell;
-    inputParams = {
-      prompt: safePrompt + " --no text --no watermark",
-      aspect_ratio: ratio,
-      output_format: "jpg",
-      output_quality: 90,
-    };
-  } else if (provider === PROVIDER_SDXL) {
-    if (ratio === "16:9") {
-      inputParams.width = 1024;
-      inputParams.height = 576;
-    }
-  } else if (provider === PROVIDER_SD) {
-    modelId = REPLICATE_MODELS.stableDiffusion;
-    if (ratio === "16:9") {
-      inputParams.width = 1024;
-      inputParams.height = 576;
-    }
-  }
-
-  const output = await replicate.run(modelId, { input: inputParams });
+  const output = await replicate.run(FLUX_SCHNELL_MODEL, { input: inputParams });
   const imageUrl = parseReplicateImageOutput(output);
   if (!imageUrl) throw new HttpsError("internal", "Replicate görsel URL döndürmedi.");
   return String(imageUrl);
@@ -177,12 +119,9 @@ exports.generateImagePrompt = onCall(async (request) => {
   return { prompt };
 });
 
-// Hangi görsel sağlayıcısının kullanılacağı sadece backend'de belirlenir (env ile değiştirilebilir).
-const DEFAULT_IMAGE_PROVIDER = PROVIDER_FLUX;
-
 // --- Callable: generateImage ---
 // İstemci sadece kullanıcı seçimlerini gönderir: eventName, eventType, isLandscape.
-// Prompt ve sağlayıcı backend'de. Eski kullanım (prompt gönderme) desteklenir.
+// Görsel üretimi her zaman Replicate Flux-Schnell ile yapılır.
 exports.generateImage = onCall(async (request) => {
   const { eventName, eventType, isLandscape } = request.data || {};
   const aspectRatio = isLandscape ? "16:9" : "1:1";
@@ -197,12 +136,7 @@ exports.generateImage = onCall(async (request) => {
     prompt = legacyPrompt;
   }
 
-  const imageUrl = await runImageGeneration({
-    prompt,
-    provider: request.data?.provider || DEFAULT_IMAGE_PROVIDER,
-    size: request.data?.size || null,
-    aspectRatio,
-  });
+  const imageUrl = await runImageGeneration({ prompt, aspectRatio });
   return { imageUrl };
 });
 
