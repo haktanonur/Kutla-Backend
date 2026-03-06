@@ -111,7 +111,7 @@ async function runImageGeneration(options) {
 }
 
 // --- Callable: generateImagePrompt (isteğe bağlı; istemci tek çağrıda generateImage kullanacak) ---
-exports.generateImagePrompt = onCall(async (request) => {
+exports.generateImagePrompt = onCall({ enforceAppCheck: true }, async (request) => {
   const { eventName, eventType, isLandscape } = request.data || {};
   if (!eventName) throw new HttpsError("invalid-argument", "eventName zorunludur.");
   const openai = getOpenAIClient();
@@ -122,7 +122,7 @@ exports.generateImagePrompt = onCall(async (request) => {
 // --- Callable: generateImage ---
 // İstemci sadece kullanıcı seçimlerini gönderir: eventName, eventType, isLandscape.
 // Görsel üretimi her zaman Replicate Flux-Schnell ile yapılır.
-exports.generateImage = onCall(async (request) => {
+exports.generateImage = onCall({ enforceAppCheck: true }, async (request) => {
   const { eventName, eventType, isLandscape } = request.data || {};
   const aspectRatio = isLandscape ? "16:9" : "1:1";
 
@@ -141,7 +141,7 @@ exports.generateImage = onCall(async (request) => {
 });
 
 // --- Callable: generateMessage ---
-exports.generateMessage = onCall(async (request) => {
+exports.generateMessage = onCall({ enforceAppCheck: true }, async (request) => {
   const { eventName, eventType, tone, companyName } = request.data || {};
   if (!eventName || !tone) throw new HttpsError("invalid-argument", "eventName ve tone gerekli.");
   if (tone === "custom") return { message: "" };
@@ -208,7 +208,7 @@ exports.generateMessage = onCall(async (request) => {
 });
 
 // --- Genel proxy (mevcut kullanım için) ---
-exports.callOpenAI = onCall(async (request) => {
+exports.callOpenAI = onCall({ enforceAppCheck: true }, async (request) => {
   const { model = "gpt-4o-mini", messages } = request.data || {};
   if (!messages || !Array.isArray(messages)) throw new HttpsError("invalid-argument", "messages dizisi gerekli.");
   const openai = getOpenAIClient();
@@ -223,7 +223,7 @@ exports.callOpenAI = onCall(async (request) => {
   };
 });
 
-exports.callReplicate = onCall(async (request) => {
+exports.callReplicate = onCall({ enforceAppCheck: true }, async (request) => {
   const { model, input } = request.data || {};
   if (!model || !input) throw new HttpsError("invalid-argument", "model ve input gerekli.");
   const replicate = getReplicateClient();
