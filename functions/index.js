@@ -15,6 +15,7 @@ const replicateToken = defineString("REPLICATE_API_TOKEN");
 
 // --- Sabitler ---
 const FLUX_SCHNELL_MODEL = "black-forest-labs/flux-schnell";
+const KLING_MODEL = "kwaivgi/kling-v1.6-standard";
 
 const ART_STYLES = [
   "Cinematic Photorealism, 8k, dramatic lighting, raytracing",
@@ -88,6 +89,42 @@ function parseReplicateImageOutput(output) {
 
 function sanitizePrompt(prompt) {
   return prompt.replace(/\s*\.?\s*$/, "") + NO_TEXT_SUFFIX;
+}
+
+function buildVideoPrompt(options) {
+  const { eventName, eventType, sourceMessage, motionStyle } = options;
+
+  let motionInstruction = "gentle and stable camera movement, soft transitions";
+  if (motionStyle === "cinematic") {
+    motionInstruction = "cinematic camera movement, smooth parallax, premium film look";
+  } else if (motionStyle === "lively") {
+    motionInstruction = "lively and energetic movement, dynamic yet clean motion";
+  }
+
+  let toneHint = "clean celebratory atmosphere";
+  if (eventType === "dini") {
+    toneHint = "respectful and serene religious celebration atmosphere";
+  } else if (eventType === "milli") {
+    toneHint = "proud and uplifting national celebration atmosphere";
+  }
+
+  const trimmedMessage = String(sourceMessage || "").trim();
+  const messageHint = trimmedMessage ? `message context: "${trimmedMessage}".` : "";
+
+  return [
+    `Create a short celebration video for "${eventName || "special day"}".`,
+    toneHint + ".",
+    motionInstruction + ".",
+    messageHint,
+    "No text overlays, no logos, no watermark.",
+    "Keep visual quality high and composition stable.",
+  ].join(" ");
+}
+
+function parseReplicateVideoOutput(output) {
+  if (typeof output === "string") return output;
+  if (Array.isArray(output)) return output[0] ?? null;
+  return output?.url ?? output ?? null;
 }
 
 /** Replicate Flux-Schnell ile görsel üretir. Prompt zaten hazır. */
@@ -229,4 +266,93 @@ exports.callReplicate = onCall({ enforceAppCheck: true }, async (request) => {
   const replicate = getReplicateClient();
   const output = await replicate.run(model, { input });
   return { output };
+});
+
+// --- Callable: createVideoGeneration (Kling image-to-video, async create) ---
+exports.createVideoGeneration = onCall({ enforceAppCheck: true }, async (request) => {
+  const {
+    sourceImageDataUrl,
+    eventName,
+    eventType,
+    sourceMessage,
+    aspectRatio = "9:16",
+    motionStyle = "calm",
+    durationSeconds = 5,
+  } = request.data || {};
+
+  if (!sourceImageDataUrl || typeof sourceImageDataUrl !== "string") {
+    throw new HttpsError("invalid-argument", "sourceImageDataUrl zorunludur.");
+  }
+
+  if (!sourceImageDataUrl.startsWith("data:image/")) {
+    throw new HttpsError("invalid-argument", "sourceImageDataUrl geçersiz.");
+  }
+
+  const supportedRatios = new Set(["9:16", "1:1", "16:9"]);
+  if (!supportedRatios.has(String(aspectRatio))) {
+    throw new HttpsError("invalid-argument", "aspectRatio desteklenmiyor.");
+  }
+
+  const duration = Number(durationSeconds);
+  if (!Number.isFinite(duration) || duration <= 0 || duration > 10) {
+    throw new HttpsError("invalid-argument", "durationSeconds geçersiz.");
+  }
+
+  const prompt = buildVideoPrompt({
+    eventName: eventName || "",
+    eventType: eventType || "",
+    sourceMessage: sourceMessage || "",
+    motionStyle: motionStyle || "calm",
+  });
+
+  const replicate = getReplicateClient();
+  let prediction;
+  try {
+    prediction = await replicate.predictions.create({
+      model: KLING_MODEL,
+      input: {
+        prompt,
+        start_image: sourceImageDataUrl,
+        aspect_ratio: String(aspectRatio),
+        duration: duration,
+      },
+    });
+  } catch (error) {
+    throw new HttpsError("internal", `Video generation create hatası: ${error?.message || "Bilinmeyen hata"}`);
+  }
+
+  if (!prediction?.id) {
+    throw new HttpsError("internal", "Prediction ID alınamadı.");
+  }
+
+  return {
+    predictionId: prediction.id,
+    status: prediction.status || "starting",
+  };
+});
+
+// --- Callable: getVideoGenerationStatus (Kling async poll) ---
+exports.getVideoGenerationStatus = onCall({ enforceAppCheck: true }, async (request) => {
+  const { predictionId } = request.data || {};
+  if (!predictionId || typeof predictionId !== "string") {
+    throw new HttpsError("invalid-argument", "predictionId zorunludur.");
+  }
+
+  const replicate = getReplicateClient();
+  let prediction;
+  try {
+    prediction = await replicate.predictions.get(predictionId);
+  } catch (error) {
+    throw new HttpsError("internal", `Video generation status hatası: ${error?.message || "Bilinmeyen hata"}`);
+  }
+
+  const status = String(prediction?.status || "unknown");
+  const outputUrl = status === "succeeded" ? parseReplicateVideoOutput(prediction?.output) : null;
+  const errorMessage = prediction?.error ? String(prediction.error) : null;
+
+  return {
+    status,
+    outputUrl: outputUrl ? String(outputUrl) : null,
+    error: errorMessage,
+  };
 });
