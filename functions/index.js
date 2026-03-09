@@ -42,10 +42,10 @@ function getReplicateClient() {
   return new Replicate({ auth: token });
 }
 
-// --- Görsel prompt üretimi (ortak kullanım) ---
-async function buildImagePrompt(openai, eventName, eventType, isLandscape) {
+async function buildImagePrompt(openai, eventName, eventType, imageAspectRatio) {
   const randomStyle = ART_STYLES[Math.floor(Math.random() * ART_STYLES.length)];
-  const format = isLandscape ? "Landscape (16:9)" : "Square (1:1)";
+  const formatMap = { "1:1": "Square (1:1)", "16:9": "Landscape (16:9)", "9:16": "Portrait (9:16)" };
+  const format = formatMap[imageAspectRatio] || "Square (1:1)";
 
   let safetyInstruction = "NO TEXT, NO LETTERS, NO WATERMARKS. ";
   if (eventType === "dini") {
@@ -92,14 +92,22 @@ function sanitizePrompt(prompt) {
 }
 
 function buildVideoPrompt(options) {
-  const { eventName, eventType, sourceMessage, motionStyle } = options;
+  const { eventName, eventType, sourceMessage, cameraMovement, atmosphere } = options;
 
-  let motionInstruction = "gentle and stable camera movement, soft transitions";
-  if (motionStyle === "cinematic") {
-    motionInstruction = "cinematic camera movement, smooth parallax, premium film look";
-  } else if (motionStyle === "lively") {
-    motionInstruction = "lively and energetic movement, dynamic yet clean motion";
-  }
+  const cameraInstructions = {
+    zoomIn: "slow zoom in, approaching subject, smooth dolly forward",
+    zoomOut: "slow zoom out, revealing full scene, expanding view",
+    pan: "smooth horizontal pan across scene, steady lateral movement",
+    orbit: "gentle orbit around subject, slow rotating perspective",
+    staticShot: "static camera, only scene elements animate, stable frame",
+  };
+
+  const atmosphereInstructions = {
+    sparkle: "glowing sparkles, shimmering light particles, celebration atmosphere",
+    cinematic: "cinematic dramatic lighting, film-like depth of field, premium quality",
+    natural: "natural subtle movement, gentle breeze, peaceful atmosphere",
+    energetic: "dynamic energetic motion, vibrant colors, festive celebration",
+  };
 
   let toneHint = "clean celebratory atmosphere";
   if (eventType === "dini") {
@@ -108,16 +116,15 @@ function buildVideoPrompt(options) {
     toneHint = "proud and uplifting national celebration atmosphere";
   }
 
-  const trimmedMessage = String(sourceMessage || "").trim();
-  const messageHint = trimmedMessage ? `message context: "${trimmedMessage}".` : "";
+  const camera = cameraInstructions[cameraMovement] || cameraInstructions.zoomIn;
+  const atmos = atmosphereInstructions[atmosphere] || atmosphereInstructions.sparkle;
 
   return [
     `Create a short celebration video for "${eventName || "special day"}".`,
-    toneHint + ".",
-    motionInstruction + ".",
-    messageHint,
-    "No text overlays, no logos, no watermark.",
-    "Keep visual quality high and composition stable.",
+    `${toneHint}.`,
+    `Camera: ${camera}.`,
+    `Atmosphere: ${atmos}.`,
+    "High visual quality, smooth motion, stable composition.",
   ].join(" ");
 }
 
@@ -149,10 +156,11 @@ async function runImageGeneration(options) {
 
 // --- Callable: generateImagePrompt (isteğe bağlı; istemci tek çağrıda generateImage kullanacak) ---
 exports.generateImagePrompt = onCall({ enforceAppCheck: true }, async (request) => {
-  const { eventName, eventType, isLandscape } = request.data || {};
+  const { eventName, eventType, isLandscape, imageAspectRatio } = request.data || {};
   if (!eventName) throw new HttpsError("invalid-argument", "eventName zorunludur.");
   const openai = getOpenAIClient();
-  const prompt = await buildImagePrompt(openai, eventName, eventType ?? null, !!isLandscape);
+  const ratio = imageAspectRatio || (isLandscape ? "16:9" : "1:1");
+  const prompt = await buildImagePrompt(openai, eventName, eventType ?? null, ratio);
   return { prompt };
 });
 
@@ -160,13 +168,13 @@ exports.generateImagePrompt = onCall({ enforceAppCheck: true }, async (request) 
 // İstemci sadece kullanıcı seçimlerini gönderir: eventName, eventType, isLandscape.
 // Görsel üretimi her zaman Replicate Flux-Schnell ile yapılır.
 exports.generateImage = onCall({ enforceAppCheck: true }, async (request) => {
-  const { eventName, eventType, isLandscape } = request.data || {};
-  const aspectRatio = isLandscape ? "16:9" : "1:1";
+  const { eventName, eventType, isLandscape, imageAspectRatio } = request.data || {};
+  const aspectRatio = imageAspectRatio || (isLandscape ? "16:9" : "1:1");
 
   let prompt;
   if (eventName != null && eventName !== "") {
     const openai = getOpenAIClient();
-    prompt = await buildImagePrompt(openai, eventName, eventType ?? null, !!isLandscape);
+    prompt = await buildImagePrompt(openai, eventName, eventType ?? null, aspectRatio);
   } else {
     const legacyPrompt = request.data?.prompt;
     if (!legacyPrompt) throw new HttpsError("invalid-argument", "eventName veya prompt zorunludur.");
@@ -275,8 +283,8 @@ exports.createVideoGeneration = onCall({ enforceAppCheck: true }, async (request
     eventName,
     eventType,
     sourceMessage,
-    aspectRatio = "9:16",
-    motionStyle = "calm",
+    cameraMovement = "zoomIn",
+    atmosphere = "sparkle",
     durationSeconds = 5,
   } = request.data || {};
 
@@ -288,11 +296,6 @@ exports.createVideoGeneration = onCall({ enforceAppCheck: true }, async (request
     throw new HttpsError("invalid-argument", "sourceImageDataUrl geçersiz.");
   }
 
-  const supportedRatios = new Set(["9:16", "1:1", "16:9"]);
-  if (!supportedRatios.has(String(aspectRatio))) {
-    throw new HttpsError("invalid-argument", "aspectRatio desteklenmiyor.");
-  }
-
   const duration = Number(durationSeconds);
   if (!Number.isFinite(duration) || duration <= 0 || duration > 10) {
     throw new HttpsError("invalid-argument", "durationSeconds geçersiz.");
@@ -302,7 +305,8 @@ exports.createVideoGeneration = onCall({ enforceAppCheck: true }, async (request
     eventName: eventName || "",
     eventType: eventType || "",
     sourceMessage: sourceMessage || "",
-    motionStyle: motionStyle || "calm",
+    cameraMovement: cameraMovement || "zoomIn",
+    atmosphere: atmosphere || "sparkle",
   });
 
   const replicate = getReplicateClient();
@@ -313,8 +317,9 @@ exports.createVideoGeneration = onCall({ enforceAppCheck: true }, async (request
       input: {
         prompt,
         start_image: sourceImageDataUrl,
-        aspect_ratio: String(aspectRatio),
         duration: duration,
+        cfg_scale: 0.5,
+        negative_prompt: "text, numbers, letters, writing, watermark, words, logo, brand, subtitle",
       },
     });
   } catch (error) {
