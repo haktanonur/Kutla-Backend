@@ -2,20 +2,24 @@
  * Kutla – Firebase Cloud Functions
  *
  * Görsel ve metin üretimi tamamen backend'de yapılır.
- * İstemci sadece kullanıcı seçimlerini gönderir: etkinlik, ton, format. Sağlayıcı backend'de seçilir.
+ * İstemci sadece kullanıcı seçimlerini gönderir: etkinlik, ton, format.
+ *
+ * AI Modelleri:
+ *   Görsel: FLUX.2 Turbo (fal.ai)
+ *   Video:  Hailuo 2.3 / Minimax Video (fal.ai)
  */
 
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const { defineString } = require("firebase-functions/params");
 const OpenAI = require("openai").default;
-const Replicate = require("replicate");
+const { fal } = require("@fal-ai/client");
 
 const openAiKey = defineString("OPENAI_API_KEY");
-const replicateToken = defineString("REPLICATE_API_TOKEN");
+const falKey = defineString("FAL_KEY");
 
 // --- Sabitler ---
-const FLUX_SCHNELL_MODEL = "black-forest-labs/flux-schnell";
-const KLING_MODEL = "kwaivgi/kling-v1.6-standard";
+const FLUX2_TURBO_MODEL = "fal-ai/flux-2/turbo";
+const HAILUO_VIDEO_MODEL = "fal-ai/minimax-video/image-to-video";
 
 const ART_STYLES = [
   "Cinematic Photorealism, 8k, dramatic lighting, raytracing",
@@ -30,16 +34,22 @@ const ART_STYLES = [
 
 const NO_TEXT_SUFFIX = " . no text, no writing, no letters, no watermark, high quality, 8k, detailed.";
 
+// --- Yardımcı fonksiyonlar ---
+
 function getOpenAIClient() {
   const key = openAiKey.value();
   if (!key) throw new HttpsError("failed-precondition", "OPENAI_API_KEY eksik.");
   return new OpenAI({ apiKey: key });
 }
 
-function getReplicateClient() {
-  const token = replicateToken.value();
-  if (!token) throw new HttpsError("failed-precondition", "REPLICATE_API_TOKEN eksik.");
-  return new Replicate({ auth: token });
+function configureFal() {
+  const key = falKey.value();
+  if (!key) throw new HttpsError("failed-precondition", "FAL_KEY eksik.");
+  fal.config({ credentials: key });
+}
+
+function sanitizePrompt(prompt) {
+  return prompt.replace(/\s*\.?\s*$/, "") + NO_TEXT_SUFFIX;
 }
 
 async function buildImagePrompt(openai, eventName, eventType, imageAspectRatio) {
@@ -81,16 +91,6 @@ async function buildImagePrompt(openai, eventName, eventType, imageAspectRatio) 
   return (completion.choices?.[0]?.message?.content ?? "").trim();
 }
 
-function parseReplicateImageOutput(output) {
-  if (typeof output === "string") return output;
-  if (Array.isArray(output)) return output[0] ?? null;
-  return output?.url ?? output ?? null;
-}
-
-function sanitizePrompt(prompt) {
-  return prompt.replace(/\s*\.?\s*$/, "") + NO_TEXT_SUFFIX;
-}
-
 function buildVideoPrompt(options) {
   const { eventName, eventType, sourceMessage, cameraMovement, atmosphere } = options;
 
@@ -128,33 +128,41 @@ function buildVideoPrompt(options) {
   ].join(" ");
 }
 
-function parseReplicateVideoOutput(output) {
-  if (typeof output === "string") return output;
-  if (Array.isArray(output)) return output[0] ?? null;
-  return output?.url ?? output ?? null;
-}
+// --- Fal.ai Image Generation (FLUX.2 Turbo) ---
 
-/** Replicate Flux-Schnell ile görsel üretir. Prompt zaten hazır. */
 async function runImageGeneration(options) {
   const { prompt, aspectRatio } = options;
   const safePrompt = sanitizePrompt(prompt);
-  const replicate = getReplicateClient();
-  const ratio = aspectRatio || "1:1";
+  configureFal();
 
-  const inputParams = {
-    prompt: safePrompt + " --no text --no watermark",
-    aspect_ratio: ratio,
-    output_format: "jpg",
-    output_quality: 90,
+  // Aspect ratio → Fal.ai image_size enum
+  const sizeMap = {
+    "1:1": "square_hd",
+    "16:9": "landscape_16_9",
+    "9:16": "portrait_16_9",
   };
+  const imageSize = sizeMap[aspectRatio] || "square_hd";
 
-  const output = await replicate.run(FLUX_SCHNELL_MODEL, { input: inputParams });
-  const imageUrl = parseReplicateImageOutput(output);
-  if (!imageUrl) throw new HttpsError("internal", "Replicate görsel URL döndürmedi.");
+  const result = await fal.subscribe(FLUX2_TURBO_MODEL, {
+    input: {
+      prompt: safePrompt,
+      image_size: imageSize,
+      num_images: 1,
+      enable_safety_checker: true,
+      output_format: "jpeg",
+    },
+  });
+
+  const imageUrl = result?.data?.images?.[0]?.url;
+  if (!imageUrl) throw new HttpsError("internal", "Fal.ai görsel URL döndürmedi.");
   return String(imageUrl);
 }
 
-// --- Callable: generateImagePrompt (isteğe bağlı; istemci tek çağrıda generateImage kullanacak) ---
+// ===================================================================
+// CALLABLE FUNCTIONS
+// ===================================================================
+
+// --- Callable: generateImagePrompt ---
 exports.generateImagePrompt = onCall({ enforceAppCheck: true }, async (request) => {
   const { eventName, eventType, isLandscape, imageAspectRatio } = request.data || {};
   if (!eventName) throw new HttpsError("invalid-argument", "eventName zorunludur.");
@@ -165,8 +173,6 @@ exports.generateImagePrompt = onCall({ enforceAppCheck: true }, async (request) 
 });
 
 // --- Callable: generateImage ---
-// İstemci sadece kullanıcı seçimlerini gönderir: eventName, eventType, isLandscape.
-// Görsel üretimi her zaman Replicate Flux-Schnell ile yapılır.
 exports.generateImage = onCall({ enforceAppCheck: true }, async (request) => {
   const { eventName, eventType, isLandscape, imageAspectRatio } = request.data || {};
   const aspectRatio = imageAspectRatio || (isLandscape ? "16:9" : "1:1");
@@ -252,7 +258,7 @@ exports.generateMessage = onCall({ enforceAppCheck: true }, async (request) => {
   return { message };
 });
 
-// --- Genel proxy (mevcut kullanım için) ---
+// --- Genel proxy: callOpenAI ---
 exports.callOpenAI = onCall({ enforceAppCheck: true }, async (request) => {
   const { model = "gpt-4o-mini", messages } = request.data || {};
   if (!messages || !Array.isArray(messages)) throw new HttpsError("invalid-argument", "messages dizisi gerekli.");
@@ -268,96 +274,61 @@ exports.callOpenAI = onCall({ enforceAppCheck: true }, async (request) => {
   };
 });
 
-exports.callReplicate = onCall({ enforceAppCheck: true }, async (request) => {
-  const { model, input } = request.data || {};
-  if (!model || !input) throw new HttpsError("invalid-argument", "model ve input gerekli.");
-  const replicate = getReplicateClient();
-  const output = await replicate.run(model, { input });
-  return { output };
-});
+// --- Callable: createVideoGeneration (Hailuo 2.3 / Minimax Video) ---
+// fal.subscribe() sonucu bekler — iOS tarafında polling gerekmez.
+exports.createVideoGeneration = onCall(
+  {
+    enforceAppCheck: true,
+    timeoutSeconds: 300,     // Video üretimi 30-120sn sürebilir
+    memory: "512MiB",
+  },
+  async (request) => {
+    const {
+      sourceImageUrl,
+      eventName,
+      eventType,
+      sourceMessage,
+      cameraMovement = "zoomIn",
+      atmosphere = "sparkle",
+    } = request.data || {};
 
-// --- Callable: createVideoGeneration (Kling image-to-video, async create) ---
-exports.createVideoGeneration = onCall({ enforceAppCheck: true }, async (request) => {
-  const {
-    sourceImageDataUrl,
-    eventName,
-    eventType,
-    sourceMessage,
-    cameraMovement = "zoomIn",
-    atmosphere = "sparkle",
-    durationSeconds = 5,
-  } = request.data || {};
+    if (!sourceImageUrl || typeof sourceImageUrl !== "string") {
+      throw new HttpsError("invalid-argument", "sourceImageUrl zorunludur.");
+    }
 
-  if (!sourceImageDataUrl || typeof sourceImageDataUrl !== "string") {
-    throw new HttpsError("invalid-argument", "sourceImageDataUrl zorunludur.");
-  }
-
-  if (!sourceImageDataUrl.startsWith("data:image/")) {
-    throw new HttpsError("invalid-argument", "sourceImageDataUrl geçersiz.");
-  }
-
-  const duration = Number(durationSeconds);
-  if (!Number.isFinite(duration) || duration <= 0 || duration > 10) {
-    throw new HttpsError("invalid-argument", "durationSeconds geçersiz.");
-  }
-
-  const prompt = buildVideoPrompt({
-    eventName: eventName || "",
-    eventType: eventType || "",
-    sourceMessage: sourceMessage || "",
-    cameraMovement: cameraMovement || "zoomIn",
-    atmosphere: atmosphere || "sparkle",
-  });
-
-  const replicate = getReplicateClient();
-  let prediction;
-  try {
-    prediction = await replicate.predictions.create({
-      model: KLING_MODEL,
-      input: {
-        prompt,
-        start_image: sourceImageDataUrl,
-        duration: duration,
-        cfg_scale: 0.5,
-        negative_prompt: "text, numbers, letters, writing, watermark, words, logo, brand, subtitle",
-      },
+    const prompt = buildVideoPrompt({
+      eventName: eventName || "",
+      eventType: eventType || "",
+      sourceMessage: sourceMessage || "",
+      cameraMovement: cameraMovement || "zoomIn",
+      atmosphere: atmosphere || "sparkle",
     });
-  } catch (error) {
-    throw new HttpsError("internal", `Video generation create hatası: ${error?.message || "Bilinmeyen hata"}`);
+
+    configureFal();
+
+    let result;
+    try {
+      result = await fal.subscribe(HAILUO_VIDEO_MODEL, {
+        input: {
+          prompt,
+          image_url: sourceImageUrl,
+          prompt_optimizer: true,
+        },
+      });
+    } catch (error) {
+      console.error("Fal.ai video generation hatası:", error);
+      throw new HttpsError(
+        "internal",
+        `Video üretim hatası: ${error?.message || "Bilinmeyen hata"}`
+      );
+    }
+
+    const videoUrl = result?.data?.video?.url;
+    if (!videoUrl) {
+      console.error("Fal.ai video URL alınamadı. result:", JSON.stringify(result));
+      throw new HttpsError("internal", "Video URL alınamadı.");
+    }
+
+    return { videoUrl: String(videoUrl) };
   }
-
-  if (!prediction?.id) {
-    throw new HttpsError("internal", "Prediction ID alınamadı.");
-  }
-
-  return {
-    predictionId: prediction.id,
-    status: prediction.status || "starting",
-  };
-});
-
-// --- Callable: getVideoGenerationStatus (Kling async poll) ---
-exports.getVideoGenerationStatus = onCall({ enforceAppCheck: true }, async (request) => {
-  const { predictionId } = request.data || {};
-  if (!predictionId || typeof predictionId !== "string") {
-    throw new HttpsError("invalid-argument", "predictionId zorunludur.");
-  }
-
-  const replicate = getReplicateClient();
-  let prediction;
-  try {
-    prediction = await replicate.predictions.get(predictionId);
-  } catch (error) {
-    throw new HttpsError("internal", `Video generation status hatası: ${error?.message || "Bilinmeyen hata"}`);
-  }
-
-  const status = String(prediction?.status || "unknown");
-  const outputUrl = status === "succeeded" ? parseReplicateVideoOutput(prediction?.output) : null;
-  const errorMessage = prediction?.error ? String(prediction.error) : null;
-
-  return {
-    status,
-    outputUrl: outputUrl ? String(outputUrl) : null,
-    error: errorMessage,
-  };
-});
+);
